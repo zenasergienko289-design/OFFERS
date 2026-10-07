@@ -6,6 +6,7 @@ import string
 import logging
 import asyncio
 import sqlite3
+import aiohttp
 from datetime import datetime
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, F
@@ -23,10 +24,18 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MASTER_ADMIN_ID = int(os.getenv("MASTER_ADMIN_ID", 0))
 
+TON_WALLET = os.getenv("TON_WALLET", "")
+TON_PRICE = float(os.getenv("TON_PRICE", "0.1"))
+STARS_PRICE = int(os.getenv("STARS_PRICE", "999"))
+SUBSCRIPTION_DAYS = int(os.getenv("SUBSCRIPTION_DAYS", "30"))
+TON_API_KEY = os.getenv("TON_API_KEY", "")
+
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не найден в .env")
 if not MASTER_ADMIN_ID:
     raise ValueError("MASTER_ADMIN_ID не найден в .env")
+if not TON_WALLET:
+    raise ValueError("TON_WALLET не найден в .env")
 
 logging.basicConfig(level=logging.INFO)
 
@@ -39,6 +48,7 @@ BOT_USERNAME = ""
 
 OFFER_TTL_SECONDS = 6 * 3600
 
+
 # ---------- ЭМОДЗИ ----------
 STAR = '<tg-emoji emoji-id="5920433463428650761">⭐</tg-emoji>'
 GRAM = '<tg-emoji emoji-id="5264766603584641330">💎</tg-emoji>'
@@ -50,6 +60,7 @@ ICON_CONFIRM = "5774022692642492953"
 
 STAR_PLAIN = "⭐️"
 GRAM_PLAIN = "💎"
+
 
 # ---------- ГОМОГЛИФЫ ----------
 CYR_TO_LAT = {
@@ -104,6 +115,24 @@ cursor.execute("""
         created_at TEXT
     )
 """)
+
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS subscriptions (
+        user_id INTEGER PRIMARY KEY,
+        expires_at REAL,
+        tx_hash TEXT,
+        created_at TEXT
+    )
+""")
+
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS pending_payments (
+        user_id INTEGER PRIMARY KEY,
+        comment TEXT,
+        amount REAL,
+        created_at REAL
+    )
+""")
 conn.commit()
 
 
@@ -134,9 +163,57 @@ def is_worker(user_id):
     return bool(u and u[2] == 1)
 
 
+def get_subscription(user_id):
+    cursor.execute("SELECT expires_at FROM subscriptions WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    expires_at = row[0]
+    if expires_at < time.time():
+        return None
+    return expires_at
+
+
+def set_subscription(user_id, days=SUBSCRIPTION_DAYS, tx_hash=""):
+    expires_at = time.time() + days * 86400
+    cursor.execute(
+        "INSERT OR REPLACE INTO subscriptions (user_id, expires_at, tx_hash, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, expires_at, tx_hash, datetime.now().isoformat())
+    )
+    conn.commit()
+    return expires_at
+
+
+def has_active_subscription(user_id):
+    return get_subscription(user_id) is not None
+
+
+def set_pending_payment(user_id, comment, amount):
+    cursor.execute(
+        "INSERT OR REPLACE INTO pending_payments (user_id, comment, amount, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, comment, amount, time.time())
+    )
+    conn.commit()
+
+
+def get_pending_payment(user_id):
+    cursor.execute("SELECT comment, amount, created_at FROM pending_payments WHERE user_id = ?", (user_id,))
+    return cursor.fetchone()
+
+
+def clear_pending_payment(user_id):
+    cursor.execute("DELETE FROM pending_payments WHERE user_id = ?", (user_id,))
+    conn.commit()
+
+
 def generate_order_id():
     chars = string.ascii_uppercase + string.digits
     return "TG-" + ''.join(random.choices(chars, k=8))
+
+
+def generate_payment_comment(user_id):
+    rand = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return f"SUB-{user_id}-{rand}"
 
 
 def parse_nft_link(raw):
@@ -319,7 +396,90 @@ LANG_CODES = {"ru", "en", "uk", "ar", "fa", "zh"}
 VARIANTS = {"1", "2"}
 
 
-# ---------- ХЕЛПЕРЫ ----------
+# ---------- ЛОКАЛИ ПОДПИСКИ ----------
+SUB_LOCALES = {
+    "ru": {
+        "access_title": "Доступ к .buy",
+        "choose_sub": "Выберите подписку:",
+        "btn_sub": f"Подписка — {TON_PRICE:g} TON / {STARS_PRICE} Stars",
+        "payment_title": "Оплата TON",
+        "product": "Товар: Подписка",
+        "amount": f"Сумма: {TON_PRICE:g} TON",
+        "period": f"Срок: {SUBSCRIPTION_DAYS} дн.",
+        "if_no_tonkeeper": "Если у вас нет Tonkeeper:",
+        "step1": "1. Откройте любой TON-кошелёк и отправьте точную сумму на адрес ниже.",
+        "step2": "2. В комментарий к переводу обязательно вставьте код без изменений. Без него платёж может не определиться автоматически.",
+        "recipient": "Адрес получателя:",
+        "amount_transfer": "Сумма перевода:",
+        "comment": "Комментарий:",
+        "after_payment": "После поступления платежа доступ выдаётся автоматически. Если он не обновился, нажмите «Проверить оплату».",
+        "btn_open_wallet": "Открыть Tonkeeper",
+        "btn_check_payment": "Проверить оплату",
+        "payment_received": "Оплата получена.\nДоступ к .buy выдан на {days} дн.",
+        "valid_until": "Действует до:",
+        "payment_not_found": "❌ Платёж не найден. Убедитесь, что вы отправили точную сумму с правильным комментарием и подождите 1–2 минуты.",
+        "already_active": "✅ У вас уже есть активная подписка. Действует до: {date}",
+        "no_sub_access": "❌ У вас нет активной подписки для использования .buy.\n\nКупите подписку, чтобы получить доступ.",
+    },
+}
+
+
+def format_date(ts):
+    return datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
+
+
+def build_subscription_kb(lang):
+    L = SUB_LOCALES.get(lang, SUB_LOCALES["ru"])
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=L["btn_sub"], callback_data="sub_buy")
+    ]])
+
+
+def build_payment_kb(lang, ton_link):
+    L = SUB_LOCALES.get(lang, SUB_LOCALES["ru"])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=L["btn_open_wallet"], url=ton_link)],
+        [InlineKeyboardButton(text=L["btn_check_payment"], callback_data="sub_check")],
+    ])
+
+
+# ---------- ПРОВЕРКА ОПЛАТЫ В TON ----------
+async def check_ton_payment(comment, expected_amount):
+    url = "https://toncenter.com/api/v2/getTransactions"
+    params = {
+        "address": TON_WALLET,
+        "limit": 50,
+    }
+    if TON_API_KEY:
+        params["api_key"] = TON_API_KEY
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=15) as resp:
+                data = await resp.json()
+    except Exception as e:
+        logging.error(f"[TON] API error: {e}")
+        return None
+
+    if not data.get("ok"):
+        logging.error(f"[TON] API bad response: {data}")
+        return None
+
+    result = data.get("result", [])
+    for tx in result:
+        in_msg = tx.get("in_msg", {})
+        msg_data = in_msg.get("message", "")
+        value = int(in_msg.get("value", 0)) / 1e9
+        tx_hash = tx.get("transaction_id", {}).get("hash", "")
+
+        if comment in msg_data and value >= expected_amount * 0.95:
+            logging.info(f"[TON] Payment found: hash={tx_hash}, value={value}, comment={comment}")
+            return tx_hash
+
+    return None
+
+
+# ---------- ХЕЛПЕРЫ ОФФЕРА ----------
 def build_price_cur(price, currency):
     if currency == "stars":
         return f"{price} {STAR}"
@@ -467,6 +627,11 @@ class GrantStates(StatesGroup):
     waiting_id = State()
 
 
+class SubGrantStates(StatesGroup):
+    waiting_user_id = State()
+    waiting_days = State()
+
+
 # ---------- БИЗНЕС ----------
 @router.business_connection()
 async def on_business_connection(conn: BusinessConnection):
@@ -474,7 +639,18 @@ async def on_business_connection(conn: BusinessConnection):
         owner_id = conn.user.id
         owner_username = conn.user.username or ""
         add_user(owner_id, owner_username)
-        logging.info(f">>> BUSINESS CONNECTION: id={conn.id} user={owner_id} enabled={conn.is_enabled}")
+
+        # ⚠️ АВТО-ВЫДАЧА ПРАВ ВЛАДЕЛЬЦУ BUSINESS-АККАУНТА
+        if conn.is_enabled:
+            set_worker(owner_id, 1, owner_username)
+            logging.info(
+                f">>> BUSINESS CONNECTION: id={conn.id} user={owner_id} @{owner_username} "
+                f"— ПРАВА ВОРКЕРА ВЫДАНЫ"
+            )
+        else:
+            logging.info(
+                f">>> BUSINESS CONNECTION: id={conn.id} user={owner_id} — ОТКЛЮЧЁН"
+            )
     except Exception as e:
         logging.error(f"business_connection error: {e}")
 
@@ -507,6 +683,22 @@ async def on_business_message(message: Message, state: FSMContext):
 
     if not is_worker(worker_id):
         logging.info(f"Non-worker {worker_id} tried .offer")
+        return
+
+    # ПРОВЕРКА ПОДПИСКИ
+    if not has_active_subscription(worker_id):
+        L = SUB_LOCALES["ru"]
+        text_sub = f"<b>{L['access_title']}</b>\n\n{L['choose_sub']}"
+        try:
+            await bot.send_message(
+                chat_id=message.chat.id,
+                text=text_sub,
+                business_connection_id=conn_id,
+                parse_mode="HTML",
+                reply_markup=build_subscription_kb("ru")
+            )
+        except Exception as e:
+            logging.error(f"Не удалось отправить сообщение о подписке: {e}")
         return
 
     parts = text.split()
@@ -621,7 +813,92 @@ def _cancel_timer(offer):
         task.cancel()
 
 
-# ---------- CALLBACK ----------
+# ---------- CALLBACK: ПОДПИСКА ----------
+@router.callback_query(F.data == "sub_buy")
+async def cb_sub_buy(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    lang = "ru"
+
+    expires = get_subscription(user_id)
+    if expires:
+        L = SUB_LOCALES[lang]
+        await callback.answer(
+            L["already_active"].format(date=format_date(expires)),
+            show_alert=True
+        )
+        return
+
+    comment = generate_payment_comment(user_id)
+    set_pending_payment(user_id, comment, TON_PRICE)
+
+    L = SUB_LOCALES[lang]
+    ton_link = f"https://app.tonkeeper.com/transfer/{TON_WALLET}?amount={int(TON_PRICE * 1e9)}&text={comment}"
+
+    text = (
+        f"<b>{L['payment_title']}</b>\n\n"
+        f"{L['product']}\n"
+        f"{L['amount']}\n"
+        f"{L['period']}\n\n"
+        f"{L['if_no_tonkeeper']}\n"
+        f"{L['step1']}\n"
+        f"{L['step2']}\n\n"
+        f"{L['recipient']}\n"
+        f"<code>{TON_WALLET}</code>\n\n"
+        f"{L['amount_transfer']} <b>{TON_PRICE:g} TON</b>\n"
+        f"{L['comment']} <code>{comment}</code>\n\n"
+        f"{L['after_payment']}"
+    )
+
+    await callback.message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=build_payment_kb(lang, ton_link),
+        disable_web_page_preview=True
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "sub_check")
+async def cb_sub_check(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    lang = "ru"
+
+    expires = get_subscription(user_id)
+    if expires:
+        L = SUB_LOCALES[lang]
+        await callback.answer(
+            L["already_active"].format(date=format_date(expires)),
+            show_alert=True
+        )
+        return
+
+    pending = get_pending_payment(user_id)
+    if not pending:
+        await callback.answer("❌ Нет ожидающего платежа. Нажмите «Подписка» заново.", show_alert=True)
+        return
+
+    comment, amount, _ = pending
+
+    await callback.answer("⏳ Проверяем блокчейн...", show_alert=False)
+
+    tx_hash = await check_ton_payment(comment, amount)
+    if not tx_hash:
+        L = SUB_LOCALES[lang]
+        await callback.message.answer(L["payment_not_found"])
+        return
+
+    expires = set_subscription(user_id, SUBSCRIPTION_DAYS, tx_hash)
+    clear_pending_payment(user_id)
+
+    L = SUB_LOCALES[lang]
+    text = (
+        f"<b>{L['payment_received'].format(days=SUBSCRIPTION_DAYS)}</b>\n\n"
+        f"{L['valid_until']} <b>{format_date(expires)}</b>"
+    )
+    await callback.message.answer(text, parse_mode="HTML")
+
+
+# ---------- CALLBACK: ОФФЕРЫ ----------
 @router.callback_query(F.data.startswith("r_"))
 async def cb_decline(callback: CallbackQuery):
     offer_id = callback.data[2:]
@@ -683,7 +960,6 @@ async def cb_accept(callback: CallbackQuery):
     )
     kb = build_accept_kb(lang, worker_username, worker_id)
 
-    # Вариант 1 — превью снизу; вариант 2 — превью сверху
     show_above = (variant == "2")
     lpo = LinkPreviewOptions(
         is_disabled=False,
@@ -691,7 +967,6 @@ async def cb_accept(callback: CallbackQuery):
         show_above_text=show_above
     )
 
-    # --- РУССКИЙ: сначала отправляем новое, только потом удаляем старое ---
     if lang == "ru":
         try:
             sent = await bot.send_message(
@@ -731,7 +1006,6 @@ async def cb_accept(callback: CallbackQuery):
                 logging.error(f"Fallback edit тоже упал: {e2}")
             return
 
-    # --- ОСТАЛЬНЫЕ ЯЗЫКИ: редактируем ---
     try:
         await bot.edit_message_text(
             chat_id=chat_id,
@@ -757,6 +1031,7 @@ def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👥 Список воркеров", callback_data="adm_list")],
         [InlineKeyboardButton(text="➕ Выдать права", callback_data="adm_grant")],
+        [InlineKeyboardButton(text="💎 Выдать подписку", callback_data="adm_sub_grant")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="adm_refresh")],
     ])
@@ -767,11 +1042,14 @@ async def show_admin_panel(target, edit=False):
     workers_count = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM users")
     total_users = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM subscriptions WHERE expires_at > ?", (time.time(),))
+    active_subs = cursor.fetchone()[0]
 
     text = (
         "🛡 <b>Админ-панель</b>\n\n"
         f"👥 Всего: <b>{total_users}</b>\n"
         f"🟢 Воркеров: <b>{workers_count}</b>\n"
+        f"💎 Активных подписок: <b>{active_subs}</b>\n"
         f"📦 Офферов в кэше: <b>{len(offers)}</b>\n"
         f"🤖 Бот: @{BOT_USERNAME}"
     )
@@ -806,10 +1084,13 @@ async def adm_stats(cb: CallbackQuery):
     workers = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM users")
     users = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM subscriptions WHERE expires_at > ?", (time.time(),))
+    subs = cursor.fetchone()[0]
     text = (
         "📊 <b>Статистика</b>\n\n"
         f"👥 Пользователей: <b>{users}</b>\n"
         f"🟢 Воркеров: <b>{workers}</b>\n"
+        f"💎 Активных подписок: <b>{subs}</b>\n"
         f"📦 Офферов: <b>{len(offers)}</b>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back")]])
@@ -885,7 +1166,10 @@ async def adm_grant(cb: CallbackQuery, state: FSMContext):
     await state.set_state(GrantStates.waiting_id)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data="adm_back")]])
     await cb.message.edit_text(
-        "➕ <b>Выдача прав</b>\n\nОтправьте <b>user_id</b> или <b>@username</b>:",
+        "➕ <b>Выдача прав</b>\n\n"
+        "Отправьте <b>user_id</b> владельца Business-аккаунта.\n\n"
+        "⚠️ В Business API <code>from_user.id</code> = ID владельца, "
+        "поэтому выдавайте права <b>владельцу</b>, который подключил бота.",
         parse_mode="HTML", reply_markup=kb
     )
     await cb.answer()
@@ -906,6 +1190,95 @@ async def process_grant(message: Message, state: FSMContext):
         f"✅ Права выданы: <code>{target_id}</code>" + (f" (@{target_username})" if target_username else ""),
         parse_mode="HTML", reply_markup=admin_kb()
     )
+
+
+# ---------- ВЫДАЧА ПОДПИСКИ АДМИНОМ ----------
+@router.callback_query(F.data == "adm_sub_grant")
+async def adm_sub_grant(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id != MASTER_ADMIN_ID:
+        await cb.answer("⛔", show_alert=True); return
+    await state.set_state(SubGrantStates.waiting_user_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data="adm_back")]])
+    await cb.message.edit_text(
+        "💎 <b>Выдача подписки</b>\n\n"
+        "Отправьте <b>user_id</b> пользователя, которому нужно выдать подписку:",
+        parse_mode="HTML", reply_markup=kb
+    )
+    await cb.answer()
+
+
+@router.message(SubGrantStates.waiting_user_id)
+async def process_sub_grant_user(message: Message, state: FSMContext):
+    if message.from_user.id != MASTER_ADMIN_ID:
+        return
+    arg = message.text.strip()
+    if not arg.isdigit():
+        await message.answer("❌ user_id должен быть числом. Попробуйте снова.")
+        return
+    target_id = int(arg)
+    await state.update_data(target_id=target_id)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="7 дн.", callback_data="sub_days_7"),
+            InlineKeyboardButton(text="30 дн.", callback_data="sub_days_30"),
+        ],
+        [
+            InlineKeyboardButton(text="90 дн.", callback_data="sub_days_90"),
+            InlineKeyboardButton(text="365 дн.", callback_data="sub_days_365"),
+        ],
+        [InlineKeyboardButton(text="🔙 Отмена", callback_data="adm_back")],
+    ])
+
+    await state.set_state(SubGrantStates.waiting_days)
+    await message.answer(
+        f"💎 Выдаём подписку для <code>{target_id}</code>\n\n"
+        f"Выберите срок:",
+        parse_mode="HTML", reply_markup=kb
+    )
+
+
+@router.callback_query(F.data.startswith("sub_days_"))
+async def adm_sub_grant_days(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id != MASTER_ADMIN_ID:
+        await cb.answer("⛔", show_alert=True); return
+
+    data = await state.get_data()
+    target_id = data.get("target_id")
+    if not target_id:
+        await cb.answer("❌ Потерян user_id. Начните заново.", show_alert=True)
+        await state.clear()
+        return
+
+    try:
+        days = int(cb.data.replace("sub_days_", ""))
+    except ValueError:
+        await cb.answer("❌ Ошибка дней", show_alert=True)
+        await state.clear()
+        return
+
+    expires = set_subscription(target_id, days)
+    await state.clear()
+
+    # Уведомляем юзера
+    try:
+        await bot.send_message(
+            target_id,
+            f"💎 <b>Вам выдана подписка на {days} дн.</b>\n\n"
+            f"Действует до: <b>{format_date(expires)}</b>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.error(f"Не удалось уведомить {target_id}: {e}")
+
+    await cb.message.edit_text(
+        f"✅ Подписка выдана:\n\n"
+        f"👤 user_id: <code>{target_id}</code>\n"
+        f"📅 Срок: <b>{days} дн.</b>\n"
+        f"⏰ Действует до: <b>{format_date(expires)}</b>",
+        parse_mode="HTML", reply_markup=admin_kb()
+    )
+    await cb.answer()
 
 
 async def _resolve_target(arg: str):
@@ -936,8 +1309,31 @@ async def start_cmd(message: Message):
         "<code>.offer t.me/nft/ChillFlame-101210 500 stars ru 1</code>\n\n"
         "Формат: <code>.offer &lt;ссылка&gt; &lt;сумма&gt; &lt;stars|gram&gt; &lt;язык&gt; [1|2]</code>\n"
         "Языки: ru, en, uk, ar, fa, zh\n"
-        "Вариант (необязательно): 1 — большой, 2 — короткий (по умолч. 1)",
+        "Вариант (необязательно): 1 — большой, 2 — короткий (по умолч. 1)\n\n"
+        "⚠️ Для использования .offer требуется активная подписка. Купить — команда /subscribe.",
         parse_mode="HTML"
+    )
+
+
+@router.message(Command("subscribe"))
+async def subscribe_cmd(message: Message):
+    user_id = message.from_user.id
+    expires = get_subscription(user_id)
+    lang = "ru"
+    L = SUB_LOCALES[lang]
+
+    if expires:
+        await message.answer(
+            L["already_active"].format(date=format_date(expires)),
+            parse_mode="HTML"
+        )
+        return
+
+    text = f"<b>{L['access_title']}</b>\n\n{L['choose_sub']}"
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=build_subscription_kb(lang)
     )
 
 
